@@ -4,7 +4,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { StatusBadge } from "@/components/StatusBadge";
-import { Plus, Search, Trash2, ArrowLeft } from "lucide-react";
+import { Plus, Search, Trash2, ArrowLeft, FileText } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -68,6 +69,7 @@ const formatMXN = (n: number | null) =>
   n != null ? `$${n.toLocaleString("es-MX", { minimumFractionDigits: 2 })}` : "—";
 
 export default function Cotizaciones() {
+  const navigate = useNavigate();
   const [cotizaciones, setCotizaciones] = useState<Cotizacion[]>([]);
   const [search, setSearch] = useState("");
   const [clientes, setClientes] = useState<Cliente[]>([]);
@@ -296,7 +298,86 @@ export default function Cotizaciones() {
     }
   };
 
-  // ─── FORM VIEW ───
+  // Convert to contract
+  const convertToContrato = async () => {
+    if (!editId || !clienteId) return;
+    const cot = cotizaciones.find(c => c.id === editId);
+    if (!cot) return;
+
+    setSaving(true);
+    try {
+      // Generate contract folio
+      const { data: lastC } = await supabase
+        .from("contratos")
+        .select("folio_c")
+        .order("id", { ascending: false })
+        .limit(1);
+      const lastNum = lastC && lastC.length > 0 ? parseInt(lastC[0].folio_c.replace(/\D/g, "")) || 0 : 0;
+      const folioC = `C-${String(lastNum + 1).padStart(4, "0")}`;
+
+      const { data: user } = await supabase.auth.getUser();
+      const clienteName = clienteMap.get(clienteId) || "";
+
+      // Create contract
+      const { data: newContrato, error } = await supabase.from("contratos").insert({
+        folio_c: folioC,
+        folio_raiz: folioC,
+        cliente_id: clienteId,
+        razon_social: clienteName,
+        estatus: "EN RENTA",
+        tipo_operacion: "RENTA",
+        subtotal: cot.subtotal,
+        iva: cot.iva,
+        importe: cot.total,
+        fecha_contrato: new Date().toISOString().split("T")[0],
+        notas: cot.notas,
+        created_by: user.user?.id || null,
+      }).select("id").single();
+      if (error) throw error;
+
+      // Copy items as contrato_items
+      const validItems = items.filter(i => i.descripcion.trim());
+      if (validItems.length > 0) {
+        const prod = await supabase.from("productos").select("id, codigo, peso_kg").in(
+          "id", validItems.filter(i => i.producto_id).map(i => i.producto_id!)
+        );
+        const prodMap = new Map((prod.data || []).map(p => [p.id, p]));
+
+        const { error: itemsErr } = await supabase.from("contrato_items").insert(
+          validItems.map(i => {
+            const p = i.producto_id ? prodMap.get(i.producto_id) : null;
+            return {
+              contrato_id: newContrato.id,
+              producto_id: i.producto_id,
+              codigo: p?.codigo || null,
+              descripcion: i.descripcion,
+              cantidad: i.cantidad,
+              precio_unitario: i.precio_unitario,
+              importe: i.importe,
+              peso_unitario_kg: p?.peso_kg || 0,
+              peso_total_kg: (p?.peso_kg || 0) * i.cantidad,
+            };
+          })
+        );
+        if (itemsErr) throw itemsErr;
+      }
+
+      // Update cotización status
+      await supabase.from("cotizaciones").update({ estatus: "convertida" }).eq("id", editId);
+
+      toast.success(`Contrato ${folioC} creado desde ${cot.folio}`);
+      setShowForm(false);
+      resetForm();
+      fetchAll();
+      navigate("/contratos");
+    } catch (err: any) {
+      toast.error(err.message || "Error al convertir");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+
   if (showForm) {
     return (
       <div className="space-y-6 animate-fade-in">
@@ -485,6 +566,11 @@ export default function Cotizaciones() {
           <Button onClick={handleSave} disabled={saving}>
             {saving ? "Guardando..." : editId ? "Actualizar Cotización" : "Crear Cotización"}
           </Button>
+          {editId && estatus === "aprobada" && (
+            <Button variant="secondary" onClick={convertToContrato} disabled={saving}>
+              <FileText className="h-4 w-4 mr-1" /> Convertir a Contrato
+            </Button>
+          )}
           <Button variant="outline" onClick={() => { setShowForm(false); resetForm(); }}>
             Cancelar
           </Button>
